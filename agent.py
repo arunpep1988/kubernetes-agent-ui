@@ -74,6 +74,63 @@ def apply_yaml(path):
     except Exception as e:
         return str(e)
 
+# ---------------- KUBERNETES RESOURCE FUNCTIONS ----------------
+
+def list_pods(namespace="default"):
+    v1 = client.CoreV1Api()
+    pods = v1.list_namespaced_pod(namespace=namespace)
+    pod_names = [pod.metadata.name for pod in pods.items]
+    return pod_names
+
+def list_services(namespace="default"):
+    v1 = client.CoreV1Api()
+    services = v1.list_namespaced_service(namespace=namespace)
+    service_names = [service.metadata.name for service in services.items]
+    return service_names
+
+def list_deployments(namespace="default"):
+    v1 = client.AppsV1Api()
+    deployments = v1.list_namespaced_deployment(namespace=namespace)
+    deployment_names = [deployment.metadata.name for deployment in deployments.items]
+    return deployment_names
+
+def list_namespaces():
+    v1 = client.CoreV1Api()
+    namespaces = v1.list_namespace()
+    namespace_names = [namespace.metadata.name for namespace in namespaces.items]
+    return namespace_names
+
+def get_pod_details(pod_name, namespace="default"):
+    v1 = client.CoreV1Api()
+    pod = v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+    return pod
+
+def create_resource_from_yaml(path):
+    try:
+        created = create_from_yaml(k8s_client, path)
+        return str(created)
+    except Exception as e:
+        return str(e)
+
+def delete_resource(kind, name, namespace="default"):
+    try:
+        if kind.lower() == "pod":
+            v1 = client.CoreV1Api()
+            v1.delete_namespaced_pod(name=name, namespace=namespace)
+            return f"Pod {name} deleted successfully."
+        elif kind.lower() == "deployment":
+            v1 = client.AppsV1Api()
+            v1.delete_namespaced_deployment(name=name, namespace=namespace)
+            return f"Deployment {name} deleted successfully."
+        elif kind.lower() == "service":
+            v1 = client.CoreV1Api()
+            v1.delete_namespaced_service(name=name, namespace=namespace)
+            return f"Service {name} deleted successfully."
+        else:
+            return "Unsupported resource kind"
+    except Exception as e:
+        return str(e)
+
 # ---------------- LLM PROMPT ----------------
 def generate(user_input, history, error=None):
     prompt = f"""
@@ -165,6 +222,39 @@ def agent(user_input):
     chat_history.append(f"User: {user_input}")
     history = "\n".join(chat_history[-5:])
 
+    # If the user wants to list pods, services, deployments, namespaces, etc.
+    if "list pods" in user_input.lower():
+        namespace = "default" if "default" in user_input.lower() else "kube-system"
+        pods = list_pods(namespace)
+        return f"Pods in {namespace}: {', '.join(pods)}"
+    
+    if "list services" in user_input.lower():
+        namespace = "default" if "default" in user_input.lower() else "kube-system"
+        services = list_services(namespace)
+        return f"Services in {namespace}: {', '.join(services)}"
+
+    if "list deployments" in user_input.lower():
+        namespace = "default" if "default" in user_input.lower() else "kube-system"
+        deployments = list_deployments(namespace)
+        return f"Deployments in {namespace}: {', '.join(deployments)}"
+
+    if "list namespaces" in user_input.lower():
+        namespaces = list_namespaces()
+        return f"Namespaces: {', '.join(namespaces)}"
+    
+    if "get pod details" in user_input.lower():
+        pod_name = user_input.split(" ")[-1]
+        pod_details = get_pod_details(pod_name)
+        return f"Pod Details: {pod_details}"
+
+    if "delete" in user_input.lower():
+        # Parse the input to extract kind, name, and namespace for deletion
+        parts = user_input.split()
+        kind = parts[1].lower()
+        name = parts[2]
+        namespace = parts[3] if len(parts) > 3 else "default"
+        return delete_resource(kind, name, namespace)
+
     yaml_text, result = generate_with_repair(user_input, history)
 
     # TEXT response
@@ -186,7 +276,3 @@ def agent(user_input):
 if __name__ == "__main__":
     print("Kubernetes AI Agent Ready")
     while True:
-        user_input = input(">> ")
-        if user_input.lower() in ["exit", "quit"]:
-            break
-        print(agent(user_input))
