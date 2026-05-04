@@ -1,104 +1,106 @@
-import subprocess
-import tempfile
 import yaml
+import tempfile
 from langchain_ollama import OllamaLLM
+from kubernetes import client, config
+from kubernetes.utils import create_from_yaml
+
+# ---------------- LOAD K8S CONFIG ----------------
+try:
+    config.load_kube_config()
+except:
+    config.load_incluster_config()
+
+k8s_client = client.ApiClient()
 
 # ---------------- LLM ----------------
 llm = OllamaLLM(model="llama3")
-
 chat_history = []
 
-
-# ---------------- CLEAN OUTPUT ----------------
+# ---------------- CLEAN YAML ----------------
 def clean_yaml(text):
     text = text.strip()
 
     if "```" in text:
         parts = text.split("```")
         for p in parts:
-            if "- name:" in p:
+            if "apiVersion:" in p:
                 text = p.replace("yaml", "").strip()
                 break
 
-    if "- name:" in text:
-        text = text[text.index("- name:"):]
+    if "apiVersion:" in text:
+        text = text[text.index("apiVersion:"):]
 
     return text.strip()
-
 
 # ---------------- PARSE YAML ----------------
 def parse_yaml(text):
     try:
-        data = yaml.safe_load(text)
-        if not isinstance(data, list):
-            return None, "Playbook must start with '- name:'"
-        return data, None
+        docs = list(yaml.safe_load_all(text))
+        if not docs:
+            return None, "Empty YAML"
+        return docs, None
     except Exception as e:
         return None, str(e)
 
-
 # ---------------- SAFETY ----------------
 def is_safe(text):
-    blocked = ["rm -rf", "shutdown", "reboot", "mkfs", "dd if="]
+    blocked = [
+        "privileged: true",
+        "hostnetwork: true",
+        "hostpid: true",
+        "hostipc: true",
+        "cluster-admin",
+        "nodeName:",
+    ]
     for b in blocked:
-        if b in text.lower():
+        if b.lower() in text.lower():
             return False, b
     return True, None
 
+# ---------------- VALIDATION ----------------
+def validate_yaml(docs):
+    try:
+        for doc in docs:
+            client.ApiClient().sanitize_for_serialization(doc)
+        return "Validation successful"
+    except Exception as e:
+        return str(e)
 
-# ---------------- ANSIBLE EXECUTION ----------------
-def run(cmd):
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return result.stdout if result.stdout else result.stderr
-
-
-def validate(path):
-    return run(["ansible-playbook", path, "--syntax-check"])
-
-
-def dry_run(path):
-    return run(["ansible-playbook", path, "--check"])
-
-
-def execute(path):
-    return run(["ansible-playbook", path])
-
+# ---------------- APPLY ----------------
+def apply_yaml(path):
+    try:
+        created = create_from_yaml(k8s_client, path)
+        return str(created)
+    except Exception as e:
+        return str(e)
 
 # ---------------- LLM PROMPT ----------------
 def generate(user_input, history, error=None):
     prompt = f"""
-You are an Ansible expert AI.
+You are a Kubernetes expert AI.
 
 Decide request type:
 
-1. PLAYBOOK GENERATION
-- If user asks to perform a task → output ONLY YAML playbook
+1. MANIFEST GENERATION
+- If user asks to deploy/create something → output ONLY YAML
 
-2. ANSIBLE KNOWLEDGE
-- If user asks concept → output TEXT explanation
+2. KUBERNETES KNOWLEDGE
+- If conceptual → output TEXT
 
-3. NON-ANSIBLE
+3. NON-KUBERNETES
 - If unrelated → output EXACTLY:
-INVALID REQUEST: ONLY ANSIBLE SUPPORTED
+INVALID REQUEST: ONLY KUBERNETES SUPPORTED
 
-PLAYBOOK RULES:
-- MUST start with '- name:'
-- Use proper YAML indentation
-- hosts: localhost
-- become: true when needed
-- Use valid Ansible modules ONLY
-- NO markdown
-- NO ``` blocks
+MANIFEST RULES:
+- MUST include apiVersion, kind, metadata, spec
+- Valid Kubernetes structure
+- No markdown
+- No ``` blocks
 
-USER MODULE:
-- DO NOT use sudo param
-- Use:
-  groups: sudo
-  append: true
-
-COMMAND RULE:
-- Use 'command'
-- Add register + debug ONLY if output needed
+BEST PRACTICES:
+- Use labels
+- Use latest stable apiVersion
+- Keep it minimal but correct
 
 Conversation:
 {history}
@@ -112,7 +114,6 @@ User:
 
     return llm.invoke(prompt).strip()
 
-
 # ---------------- AUTO REPAIR ----------------
 def generate_with_repair(user_input, history):
     error = None
@@ -122,43 +123,42 @@ def generate_with_repair(user_input, history):
 
         print("\n=== RAW LLM OUTPUT ===\n", raw)
 
-        # Handle non-ansible text response
+        # Non-K8s
         if "INVALID REQUEST" in raw:
             return None, raw
 
-        # If it's NOT YAML → treat as chat response
-        if not raw.strip().startswith("- name:"):
+        # Not YAML → treat as explanation
+        if not raw.strip().startswith("apiVersion:"):
             return None, raw
 
         cleaned = clean_yaml(raw)
 
-        parsed, err = parse_yaml(cleaned)
+        docs, err = parse_yaml(cleaned)
         if err:
             error = err
             continue
 
-        final_yaml = yaml.dump(parsed, sort_keys=False)
+        final_yaml = yaml.dump_all(docs, sort_keys=False)
 
         safe, pattern = is_safe(final_yaml)
         if not safe:
-            return None, f"Blocked unsafe command: {pattern}"
+            return None, f"Blocked unsafe config: {pattern}"
 
+        validation = validate_yaml(docs)
+        if "error" in validation.lower():
+            error = validation
+            continue
+
+        # write temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".yml", mode="w") as f:
             f.write(final_yaml)
             path = f.name
-
-        validation = validate(path)
-
-        if "ERROR" in validation:
-            error = validation
-            continue
 
         return final_yaml, path
 
     return None, f"Failed after retries:\n{error}"
 
-
-# ---------------- MAIN AGENT ----------------
+# ---------------- AGENT ----------------
 def agent(user_input):
     global chat_history
 
@@ -167,28 +167,24 @@ def agent(user_input):
 
     yaml_text, result = generate_with_repair(user_input, history)
 
-    # TEXT response (chat or invalid)
+    # TEXT response
     if not yaml_text:
         return result
 
     path = result
 
-    dry = dry_run(path)
-    run_out = execute(path)
+    apply_result = apply_yaml(path)
 
     return (
         "===== FINAL YAML =====\n"
         + yaml_text
-        + "\n\n===== DRY RUN =====\n"
-        + dry
-        + "\n\n===== EXECUTION =====\n"
-        + run_out
+        + "\n\n===== APPLY RESULT =====\n"
+        + apply_result
     )
 
-
-# ---------------- CLI LOOP ----------------
+# ---------------- CLI ----------------
 if __name__ == "__main__":
-    print("Ansible AI Agent Ready")
+    print("Kubernetes AI Agent Ready")
     while True:
         user_input = input(">> ")
         if user_input.lower() in ["exit", "quit"]:
