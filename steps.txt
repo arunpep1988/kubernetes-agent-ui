@@ -15,13 +15,14 @@ ollama pull llama3
 ollama run llama3
 ##########################
 mkdir ansible-ai-agent
-cd ansible-ai-agent
+cd kubernetes-ai-agent
 python3 -m venv venv
 source venv/bin/activate
 ##########################
 pip install langchain ollama subprocess.run
 
 pip install --upgrade langchain langchain-community langchain-core
+pip install kubernetes pyyaml langchain-ollama
 pip install langchain-ollama
 ##########################
 
