@@ -1,278 +1,224 @@
-import yaml
-import tempfile
-from langchain_ollama import OllamaLLM
-from kubernetes import client, config
-from kubernetes.utils import create_from_yaml
+# ================= CONFIG =================
+MONGO_URI = "mongodb+srv://linuxtut2024_db_user:vz1l1VLPdwKbPB0L@demo.gcwmlt4.mongodb.net/?appName=demo"
+VOYAGE_API_KEY = "al-Ly5ASI7tQFTJMloAMsC5JrONqihCPezUw6hfw2XMGfn"
+SIM_THRESHOLD = 0.70
+# ==========================================
 
-# ---------------- LOAD K8S CONFIG ----------------
+import re
+import random
+import numpy as np
+from voyageai import Client
+from pymongo import MongoClient
+from kubernetes import client, config
+
+voyage = Client(api_key=VOYAGE_API_KEY)
+
+# ---------------- K8S ----------------
 try:
     config.load_kube_config()
 except:
     config.load_incluster_config()
 
-k8s_client = client.ApiClient()
+core = client.CoreV1Api()
+apps = client.AppsV1Api()
 
-# ---------------- LLM ----------------
-llm = OllamaLLM(model="llama3")
-chat_history = []
+# ---------------- MONGO ----------------
+mongo = MongoClient(MONGO_URI)
+db = mongo["k8s_agent"]
+col = db["intents"]
 
-# ---------------- CLEAN YAML ----------------
-def clean_yaml(text):
-    text = text.strip()
+# ---------------- MEMORY ----------------
+INTENTS = []
+INTENT_EMB = []
+LAST_PODS = []
 
-    if "```" in text:
-        parts = text.split("```")
-        for p in parts:
-            if "apiVersion:" in p:
-                text = p.replace("yaml", "").strip()
-                break
+# ---------------- COSINE ----------------
+def cosine(a, b):
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-    if "apiVersion:" in text:
-        text = text[text.index("apiVersion:"):]
+# ---------------- GENERATE MANY PHRASES ----------------
+def generate_variations(base_words):
+    verbs = ["get", "show", "list", "fetch", "display"]
+    suffix = ["", "now", "please", "quickly"]
 
-    return text.strip()
+    phrases = []
+    for _ in range(200):  # generates many
+        v = random.choice(verbs)
+        w = random.choice(base_words)
+        s = random.choice(suffix)
+        phrases.append(f"{v} {w} {s}".strip())
 
-# ---------------- PARSE YAML ----------------
-def parse_yaml(text):
+    return list(set(phrases))
+
+# ---------------- INIT DB ----------------
+def init_mongo():
+    if col.count_documents({}) > 0:
+        print("✅ Intents already exist")
+        return
+
+    print("⚡ Generating ~1000 intents...")
+
+    dataset = {
+        "get_pods": ["pods", "containers", "running containers", "workloads"],
+        "get_deployments": ["deployments", "apps", "deploy"],
+        "get_services": ["services", "svc"],
+        "logs": ["logs", "container logs", "pod logs"],
+        "delete_pod": ["delete pod", "remove pod", "kill pod"],
+    }
+
+    docs = []
+
+    for intent, words in dataset.items():
+        phrases = generate_variations(words)
+
+        emb = voyage.embed(phrases, model="voyage-3").embeddings
+
+        for p, e in zip(phrases, emb):
+            docs.append({
+                "intent": intent,
+                "text": p,
+                "embedding": e
+            })
+
+    col.insert_many(docs)
+
+    print(f"Inserted {len(docs)} intents")
+
+# ---------------- LOAD INTO MEMORY ----------------
+def load_memory():
+    print("⚡ Loading intents into memory...")
+
+    docs = list(col.find())
+
+    for d in docs:
+        INTENTS.append(d["intent"])
+        INTENT_EMB.append(d["embedding"])
+
+    print(f"Loaded {len(INTENTS)} intents")
+
+# ---------------- FIND INTENT ----------------
+def find_intent(text):
+    q = voyage.embed([text], model="voyage-3").embeddings[0]
+
+    best_i = -1
+    best_score = -1
+
+    for i, e in enumerate(INTENT_EMB):
+        score = cosine(q, e)
+        if score > best_score:
+            best_score = score
+            best_i = i
+
+    if best_score < SIM_THRESHOLD:
+        return None, best_score
+
+    return INTENTS[best_i], best_score
+
+# ---------------- FORMAT ----------------
+def format_pods(pods):
+    global LAST_PODS
+    LAST_PODS = pods
+
+    out = f"{'IDX':<4}{'NAMESPACE':<18}{'NAME':<45}{'STATUS'}\n"
+    out += "-" * 90 + "\n"
+
+    for i, p in enumerate(pods):
+        out += f"{i+1:<4}{p.metadata.namespace:<18}{p.metadata.name:<45}{p.status.phase}\n"
+
+    return out
+
+# ---------------- HELPERS ----------------
+def find_pod(name):
+    name = name.lower()
+    for p in LAST_PODS:
+        if name in p.metadata.name.lower():
+            return p
+    return None
+
+# ---------------- ACTIONS ----------------
+def get_pods(ns=None):
+    pods = core.list_namespaced_pod(ns).items if ns else core.list_pod_for_all_namespaces().items
+    return format_pods(pods)
+
+def get_deployments():
+    deps = apps.list_deployment_for_all_namespaces().items
+    return "\n".join([f"{d.metadata.namespace} {d.metadata.name}" for d in deps])
+
+def get_services():
+    svcs = core.list_service_for_all_namespaces().items
+    return "\n".join([f"{s.metadata.namespace} {s.metadata.name}" for s in svcs])
+
+def logs_idx(i):
     try:
-        docs = list(yaml.safe_load_all(text))
-        if not docs:
-            return None, "Empty YAML"
-        return docs, None
-    except Exception as e:
-        return None, str(e)
+        p = LAST_PODS[i]
+        return core.read_namespaced_pod_log(p.metadata.name, p.metadata.namespace, tail_lines=100)
+    except:
+        return "❌ Invalid index"
 
-# ---------------- SAFETY ----------------
-def is_safe(text):
-    blocked = [
-        "privileged: true",
-        "hostnetwork: true",
-        "hostpid: true",
-        "hostipc: true",
-        "cluster-admin",
-        "nodeName:",
-    ]
-    for b in blocked:
-        if b.lower() in text.lower():
-            return False, b
-    return True, None
+def logs_name(name):
+    p = find_pod(name)
+    if not p:
+        return "❌ Pod not found"
+    return core.read_namespaced_pod_log(p.metadata.name, p.metadata.namespace, tail_lines=100)
 
-# ---------------- VALIDATION ----------------
-def validate_yaml(docs):
+def delete_idx(i):
     try:
-        for doc in docs:
-            client.ApiClient().sanitize_for_serialization(doc)
-        return "Validation successful"
-    except Exception as e:
-        return str(e)
+        p = LAST_PODS[i]
+        core.delete_namespaced_pod(p.metadata.name, p.metadata.namespace)
+        return f"🗑️ Deleted {p.metadata.name}"
+    except:
+        return "❌ Invalid index"
 
-# ---------------- APPLY ----------------
-def apply_yaml(path):
-    try:
-        created = create_from_yaml(k8s_client, path)
-        return str(created)
-    except Exception as e:
-        return str(e)
-
-# ---------------- KUBERNETES RESOURCE FUNCTIONS ----------------
-
-def list_pods(namespace="default"):
-    v1 = client.CoreV1Api()
-    pods = v1.list_namespaced_pod(namespace=namespace)
-    pod_names = [pod.metadata.name for pod in pods.items]
-    return pod_names
-
-def list_services(namespace="default"):
-    v1 = client.CoreV1Api()
-    services = v1.list_namespaced_service(namespace=namespace)
-    service_names = [service.metadata.name for service in services.items]
-    return service_names
-
-def list_deployments(namespace="default"):
-    v1 = client.AppsV1Api()
-    deployments = v1.list_namespaced_deployment(namespace=namespace)
-    deployment_names = [deployment.metadata.name for deployment in deployments.items]
-    return deployment_names
-
-def list_namespaces():
-    v1 = client.CoreV1Api()
-    namespaces = v1.list_namespace()
-    namespace_names = [namespace.metadata.name for namespace in namespaces.items]
-    return namespace_names
-
-def get_pod_details(pod_name, namespace="default"):
-    v1 = client.CoreV1Api()
-    pod = v1.read_namespaced_pod(name=pod_name, namespace=namespace)
-    return pod
-
-def create_resource_from_yaml(path):
-    try:
-        created = create_from_yaml(k8s_client, path)
-        return str(created)
-    except Exception as e:
-        return str(e)
-
-def delete_resource(kind, name, namespace="default"):
-    try:
-        if kind.lower() == "pod":
-            v1 = client.CoreV1Api()
-            v1.delete_namespaced_pod(name=name, namespace=namespace)
-            return f"Pod {name} deleted successfully."
-        elif kind.lower() == "deployment":
-            v1 = client.AppsV1Api()
-            v1.delete_namespaced_deployment(name=name, namespace=namespace)
-            return f"Deployment {name} deleted successfully."
-        elif kind.lower() == "service":
-            v1 = client.CoreV1Api()
-            v1.delete_namespaced_service(name=name, namespace=namespace)
-            return f"Service {name} deleted successfully."
-        else:
-            return "Unsupported resource kind"
-    except Exception as e:
-        return str(e)
-
-# ---------------- LLM PROMPT ----------------
-def generate(user_input, history, error=None):
-    prompt = f"""
-You are a Kubernetes expert AI.
-
-Decide request type:
-
-1. MANIFEST GENERATION
-- If user asks to deploy/create something → output ONLY YAML
-
-2. KUBERNETES KNOWLEDGE
-- If conceptual → output TEXT
-
-3. NON-KUBERNETES
-- If unrelated → output EXACTLY:
-INVALID REQUEST: ONLY KUBERNETES SUPPORTED
-
-MANIFEST RULES:
-- MUST include apiVersion, kind, metadata, spec
-- Valid Kubernetes structure
-- No markdown
-- No ``` blocks
-
-BEST PRACTICES:
-- Use labels
-- Use latest stable apiVersion
-- Keep it minimal but correct
-
-Conversation:
-{history}
-
-User:
-{user_input}
-"""
-
-    if error:
-        prompt += f"\nFix this error:\n{error}"
-
-    return llm.invoke(prompt).strip()
-
-# ---------------- AUTO REPAIR ----------------
-def generate_with_repair(user_input, history):
-    error = None
-
-    for _ in range(4):
-        raw = generate(user_input, history, error)
-
-        print("\n=== RAW LLM OUTPUT ===\n", raw)
-
-        # Non-K8s
-        if "INVALID REQUEST" in raw:
-            return None, raw
-
-        # Not YAML → treat as explanation
-        if not raw.strip().startswith("apiVersion:"):
-            return None, raw
-
-        cleaned = clean_yaml(raw)
-
-        docs, err = parse_yaml(cleaned)
-        if err:
-            error = err
-            continue
-
-        final_yaml = yaml.dump_all(docs, sort_keys=False)
-
-        safe, pattern = is_safe(final_yaml)
-        if not safe:
-            return None, f"Blocked unsafe config: {pattern}"
-
-        validation = validate_yaml(docs)
-        if "error" in validation.lower():
-            error = validation
-            continue
-
-        # write temp file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".yml", mode="w") as f:
-            f.write(final_yaml)
-            path = f.name
-
-        return final_yaml, path
-
-    return None, f"Failed after retries:\n{error}"
+def delete_name(name):
+    p = find_pod(name)
+    if not p:
+        return "Pod not found"
+    core.delete_namespaced_pod(p.metadata.name, p.metadata.namespace)
+    return f"Deleted {p.metadata.name}"
 
 # ---------------- AGENT ----------------
-def agent(user_input):
-    global chat_history
+def agent(q):
+    text = q.lower().strip()
 
-    chat_history.append(f"User: {user_input}")
-    history = "\n".join(chat_history[-5:])
+    if text.isdigit():
+        return logs_idx(int(text)-1)
 
-    # If the user wants to list pods, services, deployments, namespaces, etc.
-    if "list pods" in user_input.lower():
-        namespace = "default" if "default" in user_input.lower() else "kube-system"
-        pods = list_pods(namespace)
-        return f"Pods in {namespace}: {', '.join(pods)}"
-    
-    if "list services" in user_input.lower():
-        namespace = "default" if "default" in user_input.lower() else "kube-system"
-        services = list_services(namespace)
-        return f"Services in {namespace}: {', '.join(services)}"
+    if "log" in text:
+        parts = text.split()
+        return logs_idx(int(parts[-1])-1) if parts[-1].isdigit() else logs_name(parts[-1])
 
-    if "list deployments" in user_input.lower():
-        namespace = "default" if "default" in user_input.lower() else "kube-system"
-        deployments = list_deployments(namespace)
-        return f"Deployments in {namespace}: {', '.join(deployments)}"
+    if "delete" in text:
+        parts = text.split()
+        return delete_idx(int(parts[-1])-1) if parts[-1].isdigit() else delete_name(parts[-1])
 
-    if "list namespaces" in user_input.lower():
-        namespaces = list_namespaces()
-        return f"Namespaces: {', '.join(namespaces)}"
-    
-    if "get pod details" in user_input.lower():
-        pod_name = user_input.split(" ")[-1]
-        pod_details = get_pod_details(pod_name)
-        return f"Pod Details: {pod_details}"
+    ns_match = re.search(r"namespace\s+(\S+)", text)
+    ns = ns_match.group(1) if ns_match else None
 
-    if "delete" in user_input.lower():
-        # Parse the input to extract kind, name, and namespace for deletion
-        parts = user_input.split()
-        kind = parts[1].lower()
-        name = parts[2]
-        namespace = parts[3] if len(parts) > 3 else "default"
-        return delete_resource(kind, name, namespace)
+    intent, score = find_intent(text)
+    print(f"DEBUG → {intent} ({score:.2f})")
 
-    yaml_text, result = generate_with_repair(user_input, history)
+    if intent == "get_pods":
+        return get_pods(ns)
+    if intent == "get_deployments":
+        return get_deployments()
+    if intent == "get_services":
+        return get_services()
 
-    # TEXT response
-    if not yaml_text:
-        return result
+    # fallback
+    if any(x in text for x in ["pod", "container", "running"]):
+        return get_pods(ns)
 
-    path = result
+    return "❌ Not understood"
 
-    apply_result = apply_yaml(path)
-
-    return (
-        "===== FINAL YAML =====\n"
-        + yaml_text
-        + "\n\n===== APPLY RESULT =====\n"
-        + apply_result
-    )
-
-# ---------------- CLI ----------------
+# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    print("Kubernetes AI Agent Ready")
+    print("Mongo + AI Kubernetes Agent")
+
+    init_mongo()   # run once
+    load_memory()  # always load to RAM
+
     while True:
+        q = input(">> ")
+        if q in ["exit", "quit"]:
+            break
+        print(agent(q))
